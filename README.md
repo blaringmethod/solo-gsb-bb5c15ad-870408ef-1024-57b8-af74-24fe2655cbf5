@@ -1,6 +1,6 @@
-# JSON Merge, Patch, Patch-Invert, Diff, Validate, Redact & Canonicalize Service
+# JSON Merge, Patch, Patch-Invert, Diff, Validate, Redact, Materialize-Defaults & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供七个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供八个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -20,6 +20,12 @@
   [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-core)
   校验；仅允许 schema 内 `#` 本地引用，远程/无法解析的引用或无效 schema 返回
   `422`，合法 schema 一律返回 `200` 并在失败时列出全部叶子错误。
+- `POST /materialize-defaults`：接收 JSON Schema `schema` 与任意 JSON
+  `document`，在**深拷贝**上按 Draft 2020-12 为缺失的对象属性写入 schema 的
+  `default`，**绝不覆盖已有值或显式 `null`**；递归处理 `properties`、数组
+  `items`、`$ref` 与按声明顺序执行的 `allOf`，`oneOf`/`anyOf` 仅当实例恰好
+  匹配一个分支时才应用该分支默认值。返回处理后的 `document`、按 RFC 6901 排序
+  的 `applied_paths` 与 `warnings`；schema 无效时沿用 `/validate` 的 `422`。
 - `POST /canonicalize`：接收任意 JSON `document`，按
   [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)（JCS）生成无空白、确定性的
   规范 JSON 文本，并返回其 SHA-256 摘要。
@@ -428,6 +434,115 @@ curl -s -X POST http://localhost:8000/diff \
 | `unresolvable reference` | `#` 引用的指针或锚点在 schema 内不存在，或纯自引用循环 |
 | `invalid schema`         | schema 不是对象/布尔值，或不符合 Draft 2020-12 元 schema |
 
+### `POST /materialize-defaults`
+
+请求体与 `/validate` 相同：
+
+| 字段       | 类型      | 说明                                      |
+| ---------- | --------- | ----------------------------------------- |
+| `schema`   | 任意 JSON | JSON Schema Draft 2020-12（对象或布尔值） |
+| `document` | 任意 JSON | 待补全文档                                |
+
+**成功 → `200`**，在 `document` 的**深拷贝**上写入默认值，返回三个字段：
+
+```json
+{
+  "document": { "name": "anonymous", "tags": [{"v": 0}, {"v": 0}] },
+  "applied_paths": ["/name", "/tags/0/v", "/tags/1/v"],
+  "warnings": []
+}
+```
+
+```bash
+curl -s -X POST http://localhost:8000/materialize-defaults \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"type":"object","properties":{
+                    "name":{"type":"string","default":"anonymous"},
+                    "tags":{"type":"array","items":{
+                      "type":"object","properties":{"v":{"default":0}}}}}},
+       "document":{"tags":[{},{}]}}'
+```
+
+| 字段            | 说明                                                                 |
+| --------------- | -------------------------------------------------------------------- |
+| `document`      | 补全后的文档（深拷贝，**请求中的 document 不会被修改**）             |
+| `applied_paths` | 每个被写入默认值的位置（RFC 6901），同一路径只出现一次；排序沿用 `/validate`：数组索引按数值且排在成员名前，成员名按 Unicode 码点 |
+| `warnings`      | `oneOf`/`anyOf` 被跳过时的告警列表（可能为空），每条含 `instance_path`、`schema_path`、`reason`，同样按路径排序 |
+
+默认值写入规则：
+
+- **只补缺、不覆盖**：只有对象中确实**不存在**的成员才会被写入；已有值
+  （包括显式的 JSON `null`、`false`、`0`、`""`、空数组/空对象）一律保留。
+- **写入后继续向内递归**：写入的默认值若为对象/数组，会继续按该属性的
+  subschema 递归补全其内部默认值（如属性 `"c"` 的 `default` 为 `{}`，其
+  `properties` 里的缺失字段仍会被填入）。注意 `default` 的**值本身是数据而不是
+  schema**——值里恰好叫 `"default"` 的键只会原样保留。
+- **根级 `default` 不会替换整个文档**：只有对象属性可以被“补默认值”，根为标量
+  /数组时只做内部递归（数组按 `items`）。
+
+递归覆盖的关键字（按执行顺序）：
+
+1. **`properties`**：补缺并对每个存在的成员（原有的或刚写入的）递归；
+2. **数组 `items`**：对每个现有元素递归同一 subschema；
+3. **`$ref`**：解析到目标 schema 后在同一实例上继续（支持递归树等自引用结构，
+   纯自引用循环如 `{"$ref":"#"}` 会安全终止）；
+4. **`allOf`**：每个分支**按声明顺序**依次执行；同一缺失键被多个分支声明默认值
+   时，先执行到的分支写入，后执行的分支不覆盖；
+5. **`oneOf` / `anyOf`**：仅当当前实例**恰好匹配一个分支**（按 Draft 2020-12
+   对该分支校验）时才递归该分支；**零个或多个分支匹配均整体跳过**，并在
+   `warnings` 中给出 `instance_path`、`schema_path`、`reason`（说明匹配到
+   0/N 个分支）。分支内的 `$ref` 同样按请求 schema 解析。
+
+```json
+{
+  "instance_path": "",
+  "schema_path": "/oneOf",
+  "reason": "oneOf skipped: the instance matches 2 of 2 branches (indices 0, 1); defaults applied only when exactly one branch matches"
+}
+```
+
+其他要点：
+
+- schema 合法性检查与“仅本地 `#` 引用”限制完全**复用 `/validate`**：远程引用、
+  无法解析的本地引用、不符合 Draft 2020-12 元 schema 的输入一律返回 `422`，
+  响应结构与 `/validate` 完全一致（`detail` / `reason` / 可选 `ref` /
+  `message`），且在触碰 document 之前检出。
+- 布尔 schema（`true`/`false`）不携带默认值，文档原样返回。
+- 缺少 `schema` / `document` 字段或请求体不是合法 JSON → `422`。
+
+```bash
+# 已有值与显式 null 绝不覆盖；只补缺失键
+curl -s -X POST http://localhost:8000/materialize-defaults \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"properties":{"a":{"default":1},"b":{"default":2}}},
+       "document":{"a":null}}'
+# => {"document":{"a":null,"b":2},"applied_paths":["/b"],"warnings":[]}
+
+# oneOf 恰好匹配一个分支 -> 应用该分支默认值
+curl -s -X POST http://localhost:8000/materialize-defaults \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"oneOf":[{"type":"object","required":["kind"],"properties":{"v":{"default":1}}},
+                          {"type":"array"}]},
+       "document":{"kind":"x"}}'
+# => {"document":{"kind":"x","v":1},"applied_paths":["/v"],"warnings":[]}
+
+# 两个分支都匹配 -> 跳过并告警
+curl -s -X POST http://localhost:8000/materialize-defaults \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"oneOf":[{"properties":{"x":{"default":1}}},
+                          {"properties":{"y":{"default":2}}}]},
+       "document":{}}'
+# => {"document":{},"applied_paths":[],
+#     "warnings":[{"instance_path":"","schema_path":"/oneOf",
+#                  "reason":"oneOf skipped: the instance matches 2 of 2 branches ..."}]}
+
+# 远程引用 -> 422（与 /validate 一致，不发起任何网络请求）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/materialize-defaults \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"$ref":"https://example.com/s"},"document":{}}'
+# => 422
+```
+
 ### `POST /canonicalize`
 
 请求体只含一个字段，`document` 可以是**任意 JSON 值**（对象、数组、标量、甚至
@@ -702,6 +817,24 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/validate 
   -d '{"schema":{"$ref":"#/$defs/nope"},"document":{}}'
 # => 422
 
+# 按 schema 补全缺失的 default（深拷贝，已有值与显式 null 不覆盖）
+curl -s -X POST http://localhost:8000/materialize-defaults \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"$defs":{"el":{"properties":{"v":{"default":0}}}},
+                  "properties":{"name":{"default":"anonymous"},
+                                "tags":{"items":{"$ref":"#/$defs/el"}}}},
+       "document":{"tags":[{"v":9},{}]}}'
+# => {"document":{"name":"anonymous","tags":[{"v":9},{"v":0}]},
+#     "applied_paths":["/name","/tags/1/v"],"warnings":[]}
+
+# oneOf 多个分支匹配 → 不写入默认值，仅在 warnings 中说明
+curl -s -X POST http://localhost:8000/materialize-defaults \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"oneOf":[{"properties":{"x":{"default":1}}},{"properties":{"y":{"default":2}}}]},
+       "document":{}}'
+# => {"document":{},"applied_paths":[],
+#     "warnings":[{"instance_path":"","schema_path":"/oneOf","reason":"oneOf skipped: ... 2 of 2 ..."}]}
+
 # 脱敏：glob 定位 + hash/mask/remove
 curl -s -X POST http://localhost:8000/redact \
   -H 'Content-Type: application/json' \
@@ -742,22 +875,24 @@ pytest
 ## 项目结构
 
 ```
-app/main.py           # FastAPI 应用：/merge、/patch、/patch/invert、/diff、/validate、/redact 与 /canonicalize 入口
-app/patch.py          # RFC 6902 JSON Patch 校验与原子执行，并生成精确逆操作
-app/diff.py           # RFC 6902 diff 生成：对象递归比较、数组 LCS 对齐
-app/validate.py       # JSON Schema Draft 2020-12 校验、仅本地 # 引用与叶子错误收集
-app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
-app/redact.py         # JSON Pointer glob 匹配、命中裁决与脱敏动作应用
-app/jsonutil.py       # JSON 相等性、MISSING 哨兵与 RFC 6901 转义（接口共用）
-tests/test_merge.py        # /merge 测试
-tests/test_patch.py        # /patch 测试
-tests/test_patch_invert.py # /patch/invert 测试（含逆操作回滚、位移与覆盖场景）
-tests/test_diff.py         # /diff 测试（含 diff→/patch 随机往返）
-tests/test_validate.py     # /validate 测试
-tests/test_canonicalize.py # /canonicalize 测试
-tests/test_redact.py       # /redact 测试
-requirements.txt     # 运行依赖（Docker 构建时自动安装）
-requirements-dev.txt # 测试依赖
+app/main.py            # FastAPI 应用：/merge、/patch、/patch/invert、/diff、/validate、/materialize-defaults、/redact 与 /canonicalize 入口
+app/patch.py           # RFC 6902 JSON Patch 校验与原子执行，并生成精确逆操作
+app/diff.py            # RFC 6902 diff 生成：对象递归比较、数组 LCS 对齐
+app/validate.py        # JSON Schema Draft 2020-12 校验、仅本地 # 引用与叶子错误收集
+app/materialize.py     # default 物化：properties/items/$ref/allOf 递归，oneOf/anyOf 唯一分支匹配与告警
+app/canonicalize.py    # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
+app/redact.py          # JSON Pointer glob 匹配、命中裁决与脱敏动作应用
+app/jsonutil.py        # JSON 相等性、MISSING 哨兵与 RFC 6901 转义（接口共用）
+tests/test_merge.py            # /merge 测试
+tests/test_patch.py            # /patch 测试
+tests/test_patch_invert.py     # /patch/invert 测试（含逆操作回滚、位移与覆盖场景）
+tests/test_diff.py             # /diff 测试（含 diff→/patch 随机往返）
+tests/test_validate.py         # /validate 测试
+tests/test_materialize.py      # /materialize-defaults 测试
+tests/test_canonicalize.py     # /canonicalize 测试
+tests/test_redact.py           # /redact 测试
+requirements.txt      # 运行依赖（Docker 构建时自动安装）
+requirements-dev.txt  # 测试依赖
 Dockerfile
 docker-compose.yml
 ```

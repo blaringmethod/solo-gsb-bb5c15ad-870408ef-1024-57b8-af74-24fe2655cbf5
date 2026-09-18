@@ -52,6 +52,16 @@
   with fewer wildcards wins, then the one with more path tokens, then the
   one declared first. The response carries the redacted deep copy plus
   every matched RFC 6901 path; a ``remove`` winning at the root is a 409.
+
+* ``POST /materialize-defaults`` accepts ``{"schema": ..., "document": ...}``
+  and returns a deep copy of the document with missing object properties
+  filled in from the schema's ``default`` annotations per Draft 2020-12.
+  Existing values and explicit nulls are never overwritten; recursion
+  follows ``properties``, array ``items``, ``$ref`` and ``allOf`` (branches
+  in declaration order). ``oneOf`` / ``anyOf`` contribute defaults only when
+  the instance matches exactly one branch; otherwise the keyword is skipped
+  and a warning carrying ``instance_path`` / ``schema_path`` / ``reason`` is
+  returned. Invalid schemas reuse the ``/validate`` 422 shape.
 """
 
 from __future__ import annotations
@@ -66,6 +76,7 @@ from pydantic import BaseModel, Field
 from .canonicalize import CanonicalizationError, canonicalize
 from .diff import make_patch
 from .jsonutil import MISSING, escape_pointer, json_equal
+from .materialize import materialize_defaults
 from .patch import (
     PatchConflict,
     PatchStructureError,
@@ -77,7 +88,7 @@ from .validate import SchemaValidationError, build_validator, leaf_errors
 
 app = FastAPI(
     title="JSON Merge, Patch, Diff, Validate, Redact & Canonicalize Service",
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -310,3 +321,22 @@ def redact_endpoint(request: RedactRequest):
             content={"detail": "value cannot be hashed", "reason": str(exc)},
         )
     return {"document": document, "matched": matched}
+
+
+@app.post("/materialize-defaults")
+def materialize_defaults_endpoint(request: ValidateRequest):
+    try:
+        document, applied_paths, warnings = materialize_defaults(
+            request.schema_, request.document
+        )
+    except SchemaValidationError as exc:
+        content: dict = {"detail": "invalid schema", "reason": exc.reason}
+        if exc.ref is not None:
+            content["ref"] = exc.ref
+        content["message"] = exc.detail
+        return JSONResponse(status_code=422, content=content)
+    return {
+        "document": document,
+        "applied_paths": applied_paths,
+        "warnings": warnings,
+    }

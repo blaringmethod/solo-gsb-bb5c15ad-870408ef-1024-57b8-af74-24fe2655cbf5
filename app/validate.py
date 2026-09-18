@@ -170,11 +170,12 @@ def _pointer(path: Deque[Any]) -> str:
     return "".join(f"/{_escape_pointer(token)}" for token in path)
 
 
-def _path_sort_key(path: str):
-    """Sort pointer tokens as JSON types: integer array indices first.
+def pointer_sort_key(path: str):
+    """Sort an RFC 6901 pointer the way every endpoint reports paths.
 
-    Within an index token, numeric order; within a member-name token,
-    lexicographic order. The empty pointer (the whole document) sorts first.
+    Tokens are ordered as JSON types: integer array indices first (numeric
+    order), then member names (lexicographic/Unicode code point order). The
+    empty pointer (the whole document) sorts first.
     """
     if path == "":
         return ()
@@ -249,9 +250,9 @@ def leaf_errors(validator: Draft202012Validator, document: Any) -> list[dict]:
 
     leaves.sort(
         key=lambda e: (
-            _path_sort_key(e["instance_path"]),
+            pointer_sort_key(e["instance_path"]),
             e["keyword"],
-            _path_sort_key(e["schema_path"]),
+            pointer_sort_key(e["schema_path"]),
             e["message"],
         )
     )
