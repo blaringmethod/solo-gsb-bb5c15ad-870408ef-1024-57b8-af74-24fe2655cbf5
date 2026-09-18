@@ -42,6 +42,18 @@
   schema always yields 200 with ``valid`` and (on failure) every leaf
   error as RFC 6901 paths, sorted by instance path and keyword.
 
+* ``POST /materialize-defaults`` accepts the same body as ``/validate``
+  and, on a deep copy of the document, writes ``default`` annotations
+  for missing object properties as Draft 2020-12, never overwriting
+  present values or explicit nulls. It follows ``properties``, array
+  ``items``, ``$ref`` and declaration-ordered ``allOf``; ``oneOf`` /
+  ``anyOf`` contribute defaults only when the original instance matches
+  exactly one branch, otherwise they are skipped with a warning. The
+  response carries the document, the applied RFC 6901 paths (sorted per
+  RFC 6901 ordering) and warnings with ``instance_path`` /
+  ``schema_path`` / ``reason``. Invalid schemas reuse the 422 body of
+  ``/validate``.
+
 * ``POST /redact`` accepts ``{"document": ..., "rules": [...]}`` where each
   rule pairs a JSON Pointer glob ``path`` (``*`` matches exactly one
   level, ``**`` any depth including zero, arrays included) with an
@@ -66,6 +78,7 @@ from pydantic import BaseModel, Field
 from .canonicalize import CanonicalizationError, canonicalize
 from .diff import make_patch
 from .jsonutil import MISSING, escape_pointer, json_equal
+from .materialize import materialize_defaults
 from .patch import (
     PatchConflict,
     PatchStructureError,
@@ -76,8 +89,11 @@ from .redact import RedactConflict, RedactStructureError, apply_redactions
 from .validate import SchemaValidationError, build_validator, leaf_errors
 
 app = FastAPI(
-    title="JSON Merge, Patch, Diff, Validate, Redact & Canonicalize Service",
-    version="1.6.0",
+    title=(
+        "JSON Merge, Patch, Diff, Validate, Materialize-Defaults, Redact & "
+        "Canonicalize Service"
+    ),
+    version="1.7.0",
 )
 
 
@@ -259,20 +275,40 @@ class ValidateRequest(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+def _invalid_schema_response(exc: SchemaValidationError) -> JSONResponse:
+    """422 body shared by ``/validate`` and ``/materialize-defaults``."""
+    content: dict = {"detail": "invalid schema", "reason": exc.reason}
+    if exc.ref is not None:
+        content["ref"] = exc.ref
+    content["message"] = exc.detail
+    return JSONResponse(status_code=422, content=content)
+
+
 @app.post("/validate")
 def validate_endpoint(request: ValidateRequest):
     try:
         validator = build_validator(request.schema_)
         errors = leaf_errors(validator, request.document)
     except SchemaValidationError as exc:
-        content: dict = {"detail": "invalid schema", "reason": exc.reason}
-        if exc.ref is not None:
-            content["ref"] = exc.ref
-        content["message"] = exc.detail
-        return JSONResponse(status_code=422, content=content)
+        return _invalid_schema_response(exc)
     if errors:
         return {"valid": False, "errors": errors}
     return {"valid": True, "errors": []}
+
+
+@app.post("/materialize-defaults")
+def materialize_defaults_endpoint(request: ValidateRequest):
+    try:
+        document, applied_paths, warnings = materialize_defaults(
+            request.schema_, request.document
+        )
+    except SchemaValidationError as exc:
+        return _invalid_schema_response(exc)
+    return {
+        "document": document,
+        "applied_paths": applied_paths,
+        "warnings": warnings,
+    }
 
 
 class RedactRequest(BaseModel):

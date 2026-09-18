@@ -170,7 +170,7 @@ def _pointer(path: Deque[Any]) -> str:
     return "".join(f"/{_escape_pointer(token)}" for token in path)
 
 
-def _path_sort_key(path: str):
+def path_sort_key(path: str):
     """Sort pointer tokens as JSON types: integer array indices first.
 
     Within an index token, numeric order; within a member-name token,
@@ -249,9 +249,9 @@ def leaf_errors(validator: Draft202012Validator, document: Any) -> list[dict]:
 
     leaves.sort(
         key=lambda e: (
-            _path_sort_key(e["instance_path"]),
+            path_sort_key(e["instance_path"]),
             e["keyword"],
-            _path_sort_key(e["schema_path"]),
+            path_sort_key(e["schema_path"]),
             e["message"],
         )
     )
